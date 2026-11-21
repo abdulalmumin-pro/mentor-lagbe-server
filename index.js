@@ -30,24 +30,52 @@ export async function connectToMongoDB() {
   }
 }
 
-const connectedClient = await connectToMongoDB();
+await connectToMongoDB();
 const database = client.db("mentor-lagbe-db");
 const users = database.collection("user");
-const jobs = database.collection("jobs");
+const tuitions = database.collection("tuitions"); 
 
 // Home Route
 app.get("/", (req, res) => {
   res.send("Hello World!");
 });
 
-app.get("/users", async(req, res) => {
-  const cursor = users.find({});
-  const result = await cursor.toArray();
+app.get("/users", async (req, res) => {
+  const result = await users.find({}).toArray();
   res.send(result);
+});
+
+// tuitions related api
+const getTuitions = async (req, res) => {
+  const result = await tuitions.find().toArray();
+  res.send(result);
+};
+
+const createTuition = async (req, res) => {
+  const tuition = req.body;
+  const result = await tuitions.insertOne(tuition);
+  res.send(result);
+};
+
+app.get("/tuitions", getTuitions);
+app.post("/tuitions", createTuition);
+
+
+app.get("/tutions", getTuitions);
+app.post("/tutions", createTuition);
+
+app.get("/debug", async (_req, res) => {
+  const collections = await database.listCollections().toArray();
+  const counts = {};
+  for (const c of collections) {
+    counts[c.name] = await database.collection(c.name).countDocuments();
+  }
+  res.json({ database: database.databaseName, collections: counts });
 });
 
 // Start Server
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
 });
+
 export default app;
