@@ -4,6 +4,7 @@ import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
 import cors from "cors";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import Stripe from "stripe";
 
 /* -------------------------------------------------------------------------- */
 /* Config                                                                     */
@@ -20,12 +21,33 @@ const AUTH_URL = (
 ).replace(/\/+$/, "");
 const jwks = createRemoteJWKSet(new URL(`${AUTH_URL}/api/auth/jwks`));
 
+// Stripe: where to send the user back to after checkout (the Next.js app).
+const CLIENT_URL = (process.env.CLIENT_URL || "http://localhost:3000").replace(
+  /\/+$/,
+  "",
+);
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// PRO price per month in cents, decided by the SERVER from the user's role.
+const PRO_PRICE_CENTS = { tutor: 1500, student: 1000 };
+const PRO_PRODUCT_NAME = {
+  tutor: "MentorLagbe PRO (Tutor)",
+  student: "MentorLagbe PRO (Student)",
+};
+
 /* -------------------------------------------------------------------------- */
 /* App & middleware                                                           */
 /* -------------------------------------------------------------------------- */
 
 const app = express();
-app.use(express.json());
+app.use(
+  express.json({
+    // Keep the raw body: Stripe webhook signatures are checked against it.
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+);
 app.use(cors());
 
 /* -------------------------------------------------------------------------- */
@@ -53,6 +75,7 @@ const database = client.db("mentor-lagbe-db");
 const users = database.collection("user");
 const tuitions = database.collection("tuitions");
 const applications = database.collection("applications");
+const payments = database.collection("payments");
 
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
@@ -308,6 +331,152 @@ const createApplication = async (req, res) => {
 };
 
 /* -------------------------------------------------------------------------- */
+/* Route handlers: Stripe payments                                            */
+/* -------------------------------------------------------------------------- */
+
+/** Matches a user whose _id is stored as a string or as an ObjectId. */
+function userIdFilter(id) {
+  const filters = [{ _id: id }];
+  if (ObjectId.isValid(id)) filters.push({ _id: new ObjectId(id) });
+  return { $or: filters };
+}
+
+/**
+ * Saves the payment and upgrades the user to PRO.
+ * Safe to call many times for the same session (webhook + success page).
+ */
+async function fulfillCheckoutSession(session) {
+  if (session.payment_status !== "paid") return false;
+
+  const { userId, audience } = session.metadata ?? {};
+  if (!userId) return false;
+
+  const now = new Date();
+  const stripeCustomerId = session.customer ?? null;
+
+  // One payment document per Stripe session (no duplicates).
+  await payments.updateOne(
+    { stripeSessionId: session.id },
+    {
+      $setOnInsert: {
+        stripeSessionId: session.id,
+        userId,
+        email: session.customer_details?.email || session.customer_email || "",
+        audience: audience || "",
+        plan: "pro",
+        amount: (session.amount_total ?? 0) / 100,
+        currency: session.currency,
+        status: session.payment_status,
+        stripeCustomerId,
+        stripeSubscriptionId: session.subscription ?? null,
+        createdAt: now,
+      },
+    },
+    { upsert: true },
+  );
+
+  await users.updateOne(userIdFilter(userId), {
+    $set: { plan: "pro", stripeCustomerId, updatedAt: now },
+  });
+
+  return true;
+}
+
+const createCheckoutSession = async (req, res) => {
+  try {
+    // The price comes from the signed-in user's role, never from the client.
+    const audience = req.auth.role;
+    const unitAmount = PRO_PRICE_CENTS[audience];
+    if (!unitAmount) {
+      return res
+        .status(403)
+        .json({ error: "Only students and tutors can subscribe." });
+    }
+    if (req.auth.plan === "pro") {
+      return res.status(400).json({ error: "You already have the PRO plan." });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer_email: req.auth.email || undefined,
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: "usd",
+            unit_amount: unitAmount,
+            recurring: { interval: "month" },
+            product_data: { name: PRO_PRODUCT_NAME[audience] },
+          },
+        },
+      ],
+      metadata: { userId: String(req.auth.id), audience },
+      success_url: `${CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${CLIENT_URL}/payment/cancel`,
+    });
+
+    res.json({ url: session.url });
+  } catch (error) {
+    console.error("Create checkout session failed:", error);
+    res.status(500).json({ error: "Could not start checkout." });
+  }
+};
+
+/** Called by the /payment/success page to confirm the payment. */
+const verifyCheckoutSession = async (req, res) => {
+  const sessionId = text(req.query.session_id);
+  if (!sessionId.startsWith("cs_")) {
+    return res.status(400).json({ error: "Invalid session id." });
+  }
+
+  try {
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (session.metadata?.userId !== String(req.auth.id)) {
+      return res.status(403).json({ error: "This payment is not yours." });
+    }
+
+    const paid = await fulfillCheckoutSession(session);
+    res.json({ paid });
+  } catch (error) {
+    console.error("Verify checkout session failed:", error);
+    res.status(500).json({ error: "Could not verify the payment." });
+  }
+};
+
+/** Stripe calls this automatically (see the Stripe CLI / Dashboard webhook). */
+const handleStripeWebhook = async (req, res) => {
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.rawBody,
+      req.headers["stripe-signature"],
+      process.env.STRIPE_WEBHOOK_SECRET,
+    );
+  } catch (error) {
+    return res.status(400).send(`Webhook Error: ${error.message}`);
+  }
+
+  try {
+    if (event.type === "checkout.session.completed") {
+      await fulfillCheckoutSession(event.data.object);
+    }
+
+    // The subscription was cancelled: move the user back to the free plan.
+    if (event.type === "customer.subscription.deleted") {
+      await users.updateOne(
+        { stripeCustomerId: event.data.object.customer },
+        { $set: { plan: "free", updatedAt: new Date() } },
+      );
+    }
+
+    res.json({ received: true });
+  } catch (error) {
+    console.error("Stripe webhook handler failed:", error);
+    res.status(500).json({ error: "Webhook handler failed." });
+  }
+};
+
+/* -------------------------------------------------------------------------- */
 /* Routes                                                                     */
 /* -------------------------------------------------------------------------- */
 
@@ -327,6 +496,11 @@ app.post("/tutions", createTuition);
 // Applications
 app.get("/applications/check", verifyToken, verifyStudent, checkApplication);
 app.post("/applications", verifyToken, verifyStudent, createApplication);
+
+// Stripe payments
+app.post("/stripe/checkout", verifyToken, createCheckoutSession);
+app.get("/stripe/verify", verifyToken, verifyCheckoutSession);
+app.post("/stripe/webhook", handleStripeWebhook);
 
 // Debug
 app.get("/debug", getDebugInfo);
