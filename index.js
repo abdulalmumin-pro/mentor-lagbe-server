@@ -6,9 +6,6 @@ import cors from "cors";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import Stripe from "stripe";
 
-/* -------------------------------------------------------------------------- */
-/* Config                                                                     */
-/* -------------------------------------------------------------------------- */
 
 // Fix DNS issue
 dns.setServers(["8.8.8.8", "1.1.1.1"]);
