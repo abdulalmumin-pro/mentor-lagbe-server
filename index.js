@@ -5,10 +5,13 @@ import "dotenv/config";
 import cors from "cors";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
+/* -------------------------------------------------------------------------- */
+/* Config                                                                     */
+/* -------------------------------------------------------------------------- */
+
 // Fix DNS issue
 dns.setServers(["8.8.8.8", "1.1.1.1"]);
 
-const app = express();
 const port = process.env.PORT || 5000;
 
 // Better Auth issues the JWTs and exposes its public keys at /api/auth/jwks.
@@ -17,15 +20,22 @@ const AUTH_URL = (
 ).replace(/\/+$/, "");
 const jwks = createRemoteJWKSet(new URL(`${AUTH_URL}/api/auth/jwks`));
 
-// Middleware
+/* -------------------------------------------------------------------------- */
+/* App & middleware                                                           */
+/* -------------------------------------------------------------------------- */
+
+const app = express();
 app.use(express.json());
 app.use(cors());
+
+/* -------------------------------------------------------------------------- */
+/* MongoDB                                                                    */
+/* -------------------------------------------------------------------------- */
 
 const client = new MongoClient(
   `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.fcqp05s.mongodb.net/`,
 );
 
-// MongoDB Connection
 export async function connectToMongoDB() {
   try {
     await client.connect();
@@ -38,12 +48,16 @@ export async function connectToMongoDB() {
 }
 
 await connectToMongoDB();
+
 const database = client.db("mentor-lagbe-db");
 const users = database.collection("user");
 const tuitions = database.collection("tuitions");
 const applications = database.collection("applications");
 
-// Helpers
+/* -------------------------------------------------------------------------- */
+/* Helpers                                                                    */
+/* -------------------------------------------------------------------------- */
+
 const text = (value) => (typeof value === "string" ? value.trim() : "");
 
 function isValidEmail(value) {
@@ -71,6 +85,7 @@ function serializeTuition(tuition) {
 
 async function findUser(payload) {
   const filters = [];
+
   if (payload?.sub) {
     filters.push({ _id: payload.sub });
     if (ObjectId.isValid(payload.sub)) {
@@ -82,6 +97,10 @@ async function findUser(payload) {
 
   return users.findOne({ $or: filters });
 }
+
+/* -------------------------------------------------------------------------- */
+/* Auth middleware                                                            */
+/* -------------------------------------------------------------------------- */
 
 /** Verifies the Better Auth JWT and loads the current user from MongoDB. */
 async function verifyToken(req, res, next) {
@@ -119,17 +138,32 @@ function verifyStudent(req, res, next) {
   next();
 }
 
-// Home Route
-app.get("/", (req, res) => {
-  res.send("Hello World!");
-});
+/* -------------------------------------------------------------------------- */
+/* Route handlers: general                                                    */
+/* -------------------------------------------------------------------------- */
 
-app.get("/users", async (req, res) => {
+const getHome = (req, res) => {
+  res.send("Hello World!");
+};
+
+const getUsers = async (req, res) => {
   const result = await users.find({}).toArray();
   res.send(result);
-});
+};
 
-// tuitions related api
+const getDebugInfo = async (_req, res) => {
+  const collections = await database.listCollections().toArray();
+  const counts = {};
+  for (const c of collections) {
+    counts[c.name] = await database.collection(c.name).countDocuments();
+  }
+  res.json({ database: database.databaseName, collections: counts });
+};
+
+/* -------------------------------------------------------------------------- */
+/* Route handlers: tuitions                                                   */
+/* -------------------------------------------------------------------------- */
+
 const getTuitions = async (req, res) => {
   const result = await tuitions.find().toArray();
   res.send(result.map(serializeTuition));
@@ -141,10 +175,7 @@ const createTuition = async (req, res) => {
   res.send(result);
 };
 
-app.get("/tuitions", getTuitions);
-app.post("/tuitions", createTuition);
-
-app.get("/tuitions/:id", async (req, res) => {
+const getTuitionById = async (req, res) => {
   const { id } = req.params;
   if (!ObjectId.isValid(id)) {
     return res.status(400).json({ error: "Invalid tuition id." });
@@ -154,13 +185,13 @@ app.get("/tuitions/:id", async (req, res) => {
   if (!tuition) return res.status(404).json({ error: "Tuition not found." });
 
   res.json({ tuition: serializeTuition(tuition) });
-});
+};
 
-app.get("/tutions", getTuitions);
-app.post("/tutions", createTuition);
+/* -------------------------------------------------------------------------- */
+/* Route handlers: applications                                               */
+/* -------------------------------------------------------------------------- */
 
-// applications related api
-app.get("/applications/check", verifyToken, verifyStudent, async (req, res) => {
+const checkApplication = async (req, res) => {
   const tuitionId = text(req.query.tuitionId);
   if (!ObjectId.isValid(tuitionId)) {
     return res.status(400).json({ error: "Invalid tuition id." });
@@ -176,9 +207,9 @@ app.get("/applications/check", verifyToken, verifyStudent, async (req, res) => {
     applied: Boolean(application),
     status: application?.status ?? null,
   });
-});
+};
 
-app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
+const createApplication = async (req, res) => {
   const body = req.body ?? {};
 
   const tuitionId = text(body.tuitionId);
@@ -188,6 +219,7 @@ app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
   const preferredSchedule = text(body.preferredSchedule);
   const studentNote = text(body.studentNote);
 
+  // Validate input
   if (!ObjectId.isValid(tuitionId)) {
     return res.status(400).json({ error: "Invalid tuition id." });
   }
@@ -212,6 +244,7 @@ app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
     return res.status(400).json({ error: "Note must be 300 characters or fewer." });
   }
 
+  // Make sure the tuition exists and is open
   const tuition = await tuitions.findOne({ _id: new ObjectId(tuitionId) });
   if (!tuition) return res.status(404).json({ error: "Tuition not found." });
   if (tuition.approvalStatus !== "approved" || !tuitionIsActive(tuition)) {
@@ -220,6 +253,7 @@ app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
       .json({ error: "This tuition is not open for applications." });
   }
 
+  // Prevent duplicate applications
   const duplicate = await applications.findOne({
     tuitionId,
     $or: [{ studentEmail }, { studentId: req.auth.id }],
@@ -230,6 +264,7 @@ app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
       .json({ error: "You have already applied to this tuition." });
   }
 
+  // Build and save the application
   const now = new Date();
   const monthlyFee = Number(body.monthlyFee);
 
@@ -270,18 +305,36 @@ app.post("/applications", verifyToken, verifyStudent, async (req, res) => {
     }
     throw error;
   }
-});
+};
 
-app.get("/debug", async (_req, res) => {
-  const collections = await database.listCollections().toArray();
-  const counts = {};
-  for (const c of collections) {
-    counts[c.name] = await database.collection(c.name).countDocuments();
-  }
-  res.json({ database: database.databaseName, collections: counts });
-});
+/* -------------------------------------------------------------------------- */
+/* Routes                                                                     */
+/* -------------------------------------------------------------------------- */
 
-// Start Server
+// General
+app.get("/", getHome);
+app.get("/users", getUsers);
+
+// Tuitions
+app.get("/tuitions", getTuitions);
+app.post("/tuitions", createTuition);
+app.get("/tuitions/:id", getTuitionById);
+
+// Tuitions (legacy misspelled alias, kept for backwards compatibility)
+app.get("/tutions", getTuitions);
+app.post("/tutions", createTuition);
+
+// Applications
+app.get("/applications/check", verifyToken, verifyStudent, checkApplication);
+app.post("/applications", verifyToken, verifyStudent, createApplication);
+
+// Debug
+app.get("/debug", getDebugInfo);
+
+/* -------------------------------------------------------------------------- */
+/* Start server                                                               */
+/* -------------------------------------------------------------------------- */
+
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
 });
