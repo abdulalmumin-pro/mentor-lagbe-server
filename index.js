@@ -438,7 +438,7 @@ const verifyCheckoutSession = async (req, res) => {
   }
 };
 
-/** Stripe calls this automatically (see the Stripe CLI / Dashboard webhook). */
+//Stripe calls this automatically (see the Stripe CLI / Dashboard webhook). 
 const handleStripeWebhook = async (req, res) => {
   let event;
   try {
