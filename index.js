@@ -121,9 +121,6 @@ async function findUser(payload) {
   return users.findOne({ $or: filters });
 }
 
-/* -------------------------------------------------------------------------- */
-/* Auth middleware                                                            */
-/* -------------------------------------------------------------------------- */
 
 /** Verifies the Better Auth JWT and loads the current user from MongoDB. */
 async function verifyToken(req, res, next) {
