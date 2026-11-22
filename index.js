@@ -121,6 +121,9 @@ async function findUser(payload) {
   return users.findOne({ $or: filters });
 }
 
+/* -------------------------------------------------------------------------- */
+/* Auth middleware                                                            */
+/* -------------------------------------------------------------------------- */
 
 /** Verifies the Better Auth JWT and loads the current user from MongoDB. */
 async function verifyToken(req, res, next) {
@@ -338,10 +341,8 @@ function userIdFilter(id) {
   return { $or: filters };
 }
 
-/**
- * Saves the payment and upgrades the user to PRO.
- * Safe to call many times for the same session (webhook + success page).
- */
+// Saves the payment and upgrades the user to PRO.
+ 
 async function fulfillCheckoutSession(session) {
   if (session.payment_status !== "paid") return false;
 
