@@ -500,10 +500,7 @@ app.post("/stripe/webhook", handleStripeWebhook);
 // Debug
 app.get("/debug", getDebugInfo);
 
-/* -------------------------------------------------------------------------- */
-/* Start server                                                               */
-/* -------------------------------------------------------------------------- */
-
+// Start server                                                               
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
 });
